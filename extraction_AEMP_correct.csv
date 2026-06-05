@@ -28,7 +28,7 @@ IAE_Prenom;470;40;469;ABDELAZIZ                               ;ABDELAZIZ
 IAE_DateNaissance;510;8;509;19750102;19750102
 IAE_Ressortissant;518;2;517;04;04
 IAE_Lienparente;520;2;519;;;
-IAE_Niveauqualif;522;2;521;;;
+IAE_Niveauqualif;522;2;521;07;07
 IAE_Statutcadre;524;2;523;;;
 IAE_Fillerpave2;526;3;525;;;
 IAE_AEOBS;529;1;528;;
