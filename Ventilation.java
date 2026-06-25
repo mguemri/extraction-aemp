@@ -10,24 +10,26 @@ import java.util.List;
  * Ventilation (proratisation) d'une saisie unique sur plusieurs périodes.
  *
  * Idée générale (simple) :
- *  1. On a UNE ligne en HAUT : une période (du / au) + des valeurs saisies une seule fois.
- *  2. On a PLUSIEURS lignes en BAS : chacune avec sa propre période (du / au).
- *  3. On part de la période du HAUT pour retrouver les lignes du BAS concernées
- *     (celles qui tombent à l'intérieur de la période du haut).
- *  4. On répartit (ventile) chaque valeur saisie sur ces lignes,
- *     au prorata du nombre de jours de chaque période :
+ *  1. En HAUT : une ligne avec une période (du / au) + des valeurs saisies une seule fois.
+ *  2. En BAS  : plusieurs lignes, chacune avec sa propre période (du / au).
+ *  3. On part de la période du HAUT pour retrouver les lignes du BAS concernées.
+ *  4. Pour CHAQUE champ, on vérifie d'abord si l'opérateur a déjà saisi une valeur
+ *     directement en bas :
+ *        - si OUI  -> on garde la valeur saisie en bas (on n'écrase rien) ;
+ *        - si NON  -> on la remplit par ventilation depuis le haut, au prorata
+ *                     du nombre de jours (bornes incluses : 01/06 -> 04/06 = 4 jours).
  *
- *        valeurLigne = valeurSaisie * (joursDeLaLigne / joursTotalDesLignes)
+ *     La ventilation ne répartit la valeur du haut que sur les lignes restées vides
+ *     pour ce champ. Si aucune valeur n'est saisie en haut, on laisse le bas tel quel.
  *
- *     Le nombre de jours inclut les deux bornes (du 01/06 au 04/06 = 4 jours).
- *     La date de paye, elle, est simplement recopiée sur chaque ligne.
+ * Convention : une valeur {@code null} signifie « non saisie ».
  */
 public class Ventilation {
 
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("dd/MM/yyyy");
 
     // ---------------------------------------------------------------------
-    // 1) Les structures de données (volontairement simples)
+    // 1) Structures de données (simples)
     // ---------------------------------------------------------------------
 
     /** Une période avec une date de début et une date de fin. */
@@ -59,39 +61,44 @@ public class Ventilation {
         }
     }
 
-    /** La saisie unique du tableau du HAUT. */
+    /**
+     * La saisie du tableau du HAUT. Chaque champ est optionnel :
+     * {@code null} = l'opérateur n'a rien saisi en haut pour ce champ.
+     */
     static class LigneHaut {
         final Periode periode;
-        final String datePaye;     // recopiée telle quelle sur chaque ligne du bas
+        final String datePaye;   // null si non saisie
         final BigDecimal quantite;
         final BigDecimal paye;
         final BigDecimal icccp;
         final BigDecimal ifm;
         final BigDecimal primes;
 
-        LigneHaut(Periode periode, String datePaye, double quantite, double paye,
-                  double icccp, double ifm, double primes) {
+        LigneHaut(Periode periode, String datePaye, Double quantite, Double paye,
+                  Double icccp, Double ifm, Double primes) {
             this.periode = periode;
             this.datePaye = datePaye;
-            this.quantite = BigDecimal.valueOf(quantite);
-            this.paye = BigDecimal.valueOf(paye);
-            this.icccp = BigDecimal.valueOf(icccp);
-            this.ifm = BigDecimal.valueOf(ifm);
-            this.primes = BigDecimal.valueOf(primes);
+            this.quantite = toBd(quantite);
+            this.paye = toBd(paye);
+            this.icccp = toBd(icccp);
+            this.ifm = toBd(ifm);
+            this.primes = toBd(primes);
         }
     }
 
-    /** Une ligne du tableau du BAS : une période + les valeurs ventilées. */
+    /**
+     * Une ligne du tableau du BAS. Chaque champ peut être saisi directement par
+     * l'opérateur ({@code null} = non saisi, sera rempli par ventilation).
+     */
     static class LigneBas {
         final Periode periode;
 
-        // Remplies par la ventilation
-        String datePaye = "";
-        BigDecimal quantite = BigDecimal.ZERO;
-        BigDecimal paye = BigDecimal.ZERO;
-        BigDecimal icccp = BigDecimal.ZERO;
-        BigDecimal ifm = BigDecimal.ZERO;
-        BigDecimal primes = BigDecimal.ZERO;
+        String datePaye;       // null = non saisie
+        BigDecimal quantite;   // null = non saisie
+        BigDecimal paye;
+        BigDecimal icccp;
+        BigDecimal ifm;
+        BigDecimal primes;
 
         LigneBas(Periode periode) {
             this.periode = periode;
@@ -99,16 +106,14 @@ public class Ventilation {
     }
 
     // ---------------------------------------------------------------------
-    // 2) Le coeur de l'algorithme
+    // 2) Coeur de l'algorithme
     // ---------------------------------------------------------------------
 
     /**
-     * Ventile la saisie du haut sur les lignes du bas concernées.
+     * Complète les lignes du bas concernées par la période du haut, en respectant
+     * les valeurs déjà saisies directement en bas.
      *
-     * @param haut       la saisie unique (période + valeurs)
-     * @param toutesBas  toutes les lignes du bas disponibles
-     * @param decimales  nombre de décimales des montants ventilés (ex: 2)
-     * @return           uniquement les lignes du bas concernées, avec leurs valeurs ventilées
+     * @return les lignes du bas concernées, complétées.
      */
     static List<LigneBas> ventiler(LigneHaut haut, List<LigneBas> toutesBas, int decimales) {
         // Etape 1 : partir de la période du haut pour sélectionner les lignes du bas.
@@ -123,32 +128,57 @@ public class Ventilation {
                     "Aucune ligne du bas ne tombe dans la période " + haut.periode);
         }
 
-        // Etape 2 : calculer le nombre de jours par ligne et le total.
-        long[] jours = new long[concernees.size()];
+        // Etape 2 : la date de paye -> on garde celle du bas si saisie, sinon on copie celle du haut.
+        for (LigneBas ligne : concernees) {
+            if (estVide(ligne.datePaye) && !estVide(haut.datePaye)) {
+                ligne.datePaye = haut.datePaye;
+            }
+        }
+
+        // Etape 3 : chaque champ montant/quantité -> on ventile uniquement sur les lignes vides.
+        ventilerChamp(haut.quantite, concernees, l -> l.quantite, (l, v) -> l.quantite = v, decimales);
+        ventilerChamp(haut.paye,     concernees, l -> l.paye,     (l, v) -> l.paye = v,     decimales);
+        ventilerChamp(haut.icccp,    concernees, l -> l.icccp,    (l, v) -> l.icccp = v,    decimales);
+        ventilerChamp(haut.ifm,      concernees, l -> l.ifm,      (l, v) -> l.ifm = v,      decimales);
+        ventilerChamp(haut.primes,   concernees, l -> l.primes,   (l, v) -> l.primes = v,   decimales);
+
+        return concernees;
+    }
+
+    /**
+     * Ventile la valeur du haut d'un champ sur les lignes du bas restées vides pour ce champ.
+     * Les lignes déjà saisies en bas ne sont pas touchées.
+     */
+    static void ventilerChamp(BigDecimal valeurHaut, List<LigneBas> lignes,
+                              Getter getter, Setter setter, int decimales) {
+        // Rien à saisir en haut : on laisse le bas tel quel.
+        if (valeurHaut == null) {
+            return;
+        }
+
+        // On ne ventile que sur les lignes vides pour ce champ.
+        List<LigneBas> vides = new ArrayList<>();
+        for (LigneBas ligne : lignes) {
+            if (getter.get(ligne) == null) {
+                vides.add(ligne);
+            }
+        }
+        if (vides.isEmpty()) {
+            return; // toutes les lignes ont déjà une valeur saisie en bas
+        }
+
+        // Poids = nombre de jours de chaque ligne vide.
+        long[] jours = new long[vides.size()];
         long joursTotal = 0;
-        for (int i = 0; i < concernees.size(); i++) {
-            jours[i] = concernees.get(i).periode.jours();
+        for (int i = 0; i < vides.size(); i++) {
+            jours[i] = vides.get(i).periode.jours();
             joursTotal += jours[i];
         }
 
-        // Etape 3 : ventiler chaque champ au prorata des jours.
-        BigDecimal[] quantites = repartir(haut.quantite, jours, joursTotal, decimales);
-        BigDecimal[] payes     = repartir(haut.paye,     jours, joursTotal, decimales);
-        BigDecimal[] icccps    = repartir(haut.icccp,    jours, joursTotal, decimales);
-        BigDecimal[] ifms      = repartir(haut.ifm,      jours, joursTotal, decimales);
-        BigDecimal[] primess   = repartir(haut.primes,   jours, joursTotal, decimales);
-
-        // Etape 4 : recopier les résultats (et la date de paye) sur chaque ligne.
-        for (int i = 0; i < concernees.size(); i++) {
-            LigneBas ligne = concernees.get(i);
-            ligne.datePaye = haut.datePaye;
-            ligne.quantite = quantites[i];
-            ligne.paye = payes[i];
-            ligne.icccp = icccps[i];
-            ligne.ifm = ifms[i];
-            ligne.primes = primess[i];
+        BigDecimal[] parts = repartir(valeurHaut, jours, joursTotal, decimales);
+        for (int i = 0; i < vides.size(); i++) {
+            setter.set(vides.get(i), parts[i]);
         }
-        return concernees;
     }
 
     /**
@@ -162,7 +192,7 @@ public class Ventilation {
         BigDecimal joursTotalBd = BigDecimal.valueOf(joursTotal);
         BigDecimal unite = BigDecimal.ONE.movePointLeft(decimales); // ex : 0.01
 
-        // 3a) Part de chaque ligne, arrondie vers le bas, + mémorisation du reste.
+        // Part de chaque ligne, arrondie vers le bas, + mémorisation du reste.
         BigDecimal[] restes = new BigDecimal[jours.length];
         BigDecimal sommeParts = BigDecimal.ZERO;
         for (int i = 0; i < jours.length; i++) {
@@ -174,7 +204,7 @@ public class Ventilation {
             sommeParts = sommeParts.add(parts[i]);
         }
 
-        // 3b) Distribuer les unités manquantes aux lignes ayant le plus fort reste.
+        // Distribuer les unités manquantes aux lignes ayant le plus fort reste.
         int manquantes = totalArrondi.subtract(sommeParts)
                 .divide(unite, 0, RoundingMode.HALF_UP).intValueExact();
         for (int n = 0; n < manquantes; n++) {
@@ -191,61 +221,67 @@ public class Ventilation {
     }
 
     // ---------------------------------------------------------------------
+    // Petits utilitaires
+    // ---------------------------------------------------------------------
+
+    interface Getter { BigDecimal get(LigneBas l); }
+    interface Setter { void set(LigneBas l, BigDecimal v); }
+
+    static boolean estVide(String s) {
+        return s == null || s.trim().isEmpty();
+    }
+
+    static BigDecimal toBd(Double d) {
+        return d == null ? null : BigDecimal.valueOf(d);
+    }
+
+    static String affiche(BigDecimal v) {
+        return v == null ? "-" : v.toPlainString();
+    }
+
+    // ---------------------------------------------------------------------
     // 3) Exemple d'utilisation
     // ---------------------------------------------------------------------
 
     public static void main(String[] args) {
         // Tableau du BAS : toutes les périodes disponibles.
         List<LigneBas> toutesBas = new ArrayList<>();
-        toutesBas.add(new LigneBas(new Periode("01/06/2025", "01/06/2025"))); // 1 jour
-        toutesBas.add(new LigneBas(new Periode("04/06/2025", "05/06/2025"))); // 2 jours
-        toutesBas.add(new LigneBas(new Periode("10/06/2025", "12/06/2025"))); // 3 jours
+        LigneBas l1 = new LigneBas(new Periode("01/06/2025", "01/06/2025")); // 1 jour
+        LigneBas l2 = new LigneBas(new Periode("04/06/2025", "05/06/2025")); // 2 jours
+        LigneBas l3 = new LigneBas(new Periode("10/06/2025", "12/06/2025")); // 3 jours
+
+        // L'opérateur a saisi DIRECTEMENT en bas certaines valeurs :
+        l2.paye = new BigDecimal("5000");   // paye saisie à la main -> on ne l'écrase pas
+        l1.datePaye = "01/06/2025";          // date de paye saisie à la main sur la 1re ligne
+
+        toutesBas.add(l1);
+        toutesBas.add(l2);
+        toutesBas.add(l3);
         toutesBas.add(new LigneBas(new Periode("05/07/2025", "06/07/2025"))); // hors période (ignorée)
 
-        // Tableau du HAUT : une seule saisie pour la période 01/06 -> 30/06.
+        // Tableau du HAUT : une seule saisie (certains champs peuvent être null = non saisis).
         LigneHaut haut = new LigneHaut(
                 new Periode("01/06/2025", "30/06/2025"),
-                "30/06/2025", // date de paye (recopiée)
-                6,            // quantité
-                23882,        // paye
-                1200,         // icccp
-                800,          // ifm
-                300           // primes
+                "30/06/2025", // date de paye
+                6.0,          // quantité
+                23882.0,      // paye
+                1200.0,       // icccp
+                800.0,        // ifm
+                null          // primes : non saisi en haut -> rien à ventiler
         );
 
-        // Ventilation : on part de la période du haut pour retrouver les lignes du bas.
         List<LigneBas> resultat = ventiler(haut, toutesBas, 2);
 
         // Affichage.
-        long joursTotal = resultat.stream().mapToLong(l -> l.periode.jours()).sum();
         System.out.println("Période du haut : " + haut.periode);
-        System.out.println("Lignes du bas concernées : " + resultat.size()
-                + " (total " + joursTotal + " jours)\n");
-
+        System.out.println("Lignes du bas concernées : " + resultat.size() + "\n");
         System.out.printf("%-24s %-6s %-11s %-11s %-9s %-8s %-8s%n",
                 "Période", "Jours", "DatePaye", "Paye", "ICCCP", "IFM", "Primes");
         for (LigneBas l : resultat) {
             System.out.printf("%-24s %-6d %-11s %-11s %-9s %-8s %-8s%n",
-                    l.periode, l.periode.jours(), l.datePaye, l.paye, l.icccp, l.ifm, l.primes);
+                    l.periode, l.periode.jours(),
+                    estVide(l.datePaye) ? "-" : l.datePaye,
+                    affiche(l.paye), affiche(l.icccp), affiche(l.ifm), affiche(l.primes));
         }
-
-        // Contrôle : la somme des lignes doit égaler la saisie du haut.
-        System.out.println("\nContrôle des totaux (doivent égaler la saisie) :");
-        System.out.println("  Paye   : " + somme(resultat, l -> l.paye)   + " / " + haut.paye);
-        System.out.println("  ICCCP  : " + somme(resultat, l -> l.icccp)  + " / " + haut.icccp);
-        System.out.println("  IFM    : " + somme(resultat, l -> l.ifm)    + " / " + haut.ifm);
-        System.out.println("  Primes : " + somme(resultat, l -> l.primes) + " / " + haut.primes);
-        System.out.println("  Qté    : " + somme(resultat, l -> l.quantite) + " / " + haut.quantite);
-    }
-
-    /** Petite aide pour additionner un champ de toutes les lignes. */
-    interface Champ { BigDecimal de(LigneBas l); }
-
-    static BigDecimal somme(List<LigneBas> lignes, Champ champ) {
-        BigDecimal total = BigDecimal.ZERO;
-        for (LigneBas l : lignes) {
-            total = total.add(champ.de(l));
-        }
-        return total;
     }
 }
