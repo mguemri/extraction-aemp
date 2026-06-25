@@ -7,225 +7,245 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Algorithme de ventilation (proratisation).
+ * Ventilation (proratisation) d'une saisie unique sur plusieurs périodes.
  *
- * Contexte:
- *  - Tableau du BAS  : plusieurs lignes, chacune avec une période (du / au).
- *      ex: 01/06/2025 -> 01/06/2025
- *          04/06/2025 -> 05/06/2025
- *          10/06/2025 -> 12/06/2025
- *  - Tableau du HAUT : une seule ligne couvrant la période globale (ex: 01/06/2025 -> 30/06/2025)
- *    sur laquelle l'utilisateur saisit UNE seule fois les montants/quantités.
+ * Idée générale (simple) :
+ *  1. On a UNE ligne en HAUT : une période (du / au) + des valeurs saisies une seule fois.
+ *  2. On a PLUSIEURS lignes en BAS : chacune avec sa propre période (du / au).
+ *  3. On part de la période du HAUT pour retrouver les lignes du BAS concernées
+ *     (celles qui tombent à l'intérieur de la période du haut).
+ *  4. On répartit (ventile) chaque valeur saisie sur ces lignes,
+ *     au prorata du nombre de jours de chaque période :
  *
- * Règle:
- *  - La "date de paye" saisie en haut est recopiée telle quelle sur chaque ligne du bas.
- *  - Les montants (paye, icccp, ifm, primes) et la quantité saisis en haut sont
- *    ventilés sur les lignes du bas au prorata du nombre de jours de chaque période.
+ *        valeurLigne = valeurSaisie * (joursDeLaLigne / joursTotalDesLignes)
  *
- *    valeurLigne = valeurSaisie * (nbJoursLigne / nbJoursTotalDesLignes)
- *
- *    Le nombre de jours est compté en INCLUANT les deux bornes
- *    (du 01/06 au 04/06 = 4 jours).
- *
- *  - La répartition utilise la méthode du plus fort reste afin que la somme
- *    des lignes ventilées soit STRICTEMENT égale au montant saisi (pas de perte
- *    ni de gain dû aux arrondis).
+ *     Le nombre de jours inclut les deux bornes (du 01/06 au 04/06 = 4 jours).
+ *     La date de paye, elle, est simplement recopiée sur chaque ligne.
  */
 public class Ventilation {
 
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("dd/MM/yyyy");
 
-    /** Une ligne du tableau du bas: une période et les valeurs ventilées. */
-    static class LignePeriode {
-        final LocalDate dateDebut;
-        final LocalDate dateFin;
-        final long nbJours;
+    // ---------------------------------------------------------------------
+    // 1) Les structures de données (volontairement simples)
+    // ---------------------------------------------------------------------
 
-        // Valeurs reçues par ventilation
-        String datePaye;
+    /** Une période avec une date de début et une date de fin. */
+    static class Periode {
+        final LocalDate debut;
+        final LocalDate fin;
+
+        Periode(String debut, String fin) {
+            this.debut = LocalDate.parse(debut, FMT);
+            this.fin = LocalDate.parse(fin, FMT);
+            if (this.fin.isBefore(this.debut)) {
+                throw new IllegalArgumentException("Période invalide : " + debut + " -> " + fin);
+            }
+        }
+
+        /** Nombre de jours, bornes incluses (01/06 -> 04/06 = 4). */
+        long jours() {
+            return ChronoUnit.DAYS.between(debut, fin) + 1;
+        }
+
+        /** Vrai si cette période est entièrement contenue dans {@code autre}. */
+        boolean estDans(Periode autre) {
+            return !debut.isBefore(autre.debut) && !fin.isAfter(autre.fin);
+        }
+
+        @Override
+        public String toString() {
+            return debut.format(FMT) + " -> " + fin.format(FMT);
+        }
+    }
+
+    /** La saisie unique du tableau du HAUT. */
+    static class LigneHaut {
+        final Periode periode;
+        final String datePaye;     // recopiée telle quelle sur chaque ligne du bas
+        final BigDecimal quantite;
+        final BigDecimal paye;
+        final BigDecimal icccp;
+        final BigDecimal ifm;
+        final BigDecimal primes;
+
+        LigneHaut(Periode periode, String datePaye, double quantite, double paye,
+                  double icccp, double ifm, double primes) {
+            this.periode = periode;
+            this.datePaye = datePaye;
+            this.quantite = BigDecimal.valueOf(quantite);
+            this.paye = BigDecimal.valueOf(paye);
+            this.icccp = BigDecimal.valueOf(icccp);
+            this.ifm = BigDecimal.valueOf(ifm);
+            this.primes = BigDecimal.valueOf(primes);
+        }
+    }
+
+    /** Une ligne du tableau du BAS : une période + les valeurs ventilées. */
+    static class LigneBas {
+        final Periode periode;
+
+        // Remplies par la ventilation
+        String datePaye = "";
         BigDecimal quantite = BigDecimal.ZERO;
         BigDecimal paye = BigDecimal.ZERO;
         BigDecimal icccp = BigDecimal.ZERO;
         BigDecimal ifm = BigDecimal.ZERO;
         BigDecimal primes = BigDecimal.ZERO;
 
-        LignePeriode(LocalDate dateDebut, LocalDate dateFin) {
-            if (dateFin.isBefore(dateDebut)) {
-                throw new IllegalArgumentException(
-                        "Période invalide: " + dateDebut.format(FMT) + " -> " + dateFin.format(FMT));
-            }
-            this.dateDebut = dateDebut;
-            this.dateFin = dateFin;
-            // +1 car les deux bornes sont incluses
-            this.nbJours = ChronoUnit.DAYS.between(dateDebut, dateFin) + 1;
-        }
-
-        LignePeriode(String dateDebut, String dateFin) {
-            this(LocalDate.parse(dateDebut, FMT), LocalDate.parse(dateFin, FMT));
+        LigneBas(Periode periode) {
+            this.periode = periode;
         }
     }
 
-    /** La saisie unique du tableau du haut. */
-    static class SaisieHaut {
-        String datePaye;          // recopiée sur chaque ligne
-        BigDecimal quantite;
-        BigDecimal paye;
-        BigDecimal icccp;
-        BigDecimal ifm;
-        BigDecimal primes;
-
-        SaisieHaut(String datePaye, BigDecimal quantite, BigDecimal paye,
-                   BigDecimal icccp, BigDecimal ifm, BigDecimal primes) {
-            this.datePaye = datePaye;
-            this.quantite = quantite;
-            this.paye = paye;
-            this.icccp = icccp;
-            this.ifm = ifm;
-            this.primes = primes;
-        }
-    }
+    // ---------------------------------------------------------------------
+    // 2) Le coeur de l'algorithme
+    // ---------------------------------------------------------------------
 
     /**
-     * Ventile la saisie du haut sur les lignes du bas, au prorata du nombre de jours.
+     * Ventile la saisie du haut sur les lignes du bas concernées.
      *
-     * @param lignes   lignes du tableau du bas (modifiées en place)
-     * @param saisie   saisie unique du tableau du haut
-     * @param decimales nombre de décimales à conserver pour les montants ventilés
+     * @param haut       la saisie unique (période + valeurs)
+     * @param toutesBas  toutes les lignes du bas disponibles
+     * @param decimales  nombre de décimales des montants ventilés (ex: 2)
+     * @return           uniquement les lignes du bas concernées, avec leurs valeurs ventilées
      */
-    static void ventiler(List<LignePeriode> lignes, SaisieHaut saisie, int decimales) {
-        if (lignes == null || lignes.isEmpty()) {
-            throw new IllegalArgumentException("Aucune ligne à ventiler.");
+    static List<LigneBas> ventiler(LigneHaut haut, List<LigneBas> toutesBas, int decimales) {
+        // Etape 1 : partir de la période du haut pour sélectionner les lignes du bas.
+        List<LigneBas> concernees = new ArrayList<>();
+        for (LigneBas ligne : toutesBas) {
+            if (ligne.periode.estDans(haut.periode)) {
+                concernees.add(ligne);
+            }
+        }
+        if (concernees.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Aucune ligne du bas ne tombe dans la période " + haut.periode);
         }
 
-        long totalJours = 0;
-        for (LignePeriode l : lignes) {
-            totalJours += l.nbJours;
-        }
-        if (totalJours <= 0) {
-            throw new IllegalArgumentException("Le nombre total de jours doit être strictement positif.");
-        }
-
-        // Poids = nb de jours de chaque ligne
-        long[] poids = new long[lignes.size()];
-        for (int i = 0; i < lignes.size(); i++) {
-            poids[i] = lignes.get(i).nbJours;
+        // Etape 2 : calculer le nombre de jours par ligne et le total.
+        long[] jours = new long[concernees.size()];
+        long joursTotal = 0;
+        for (int i = 0; i < concernees.size(); i++) {
+            jours[i] = concernees.get(i).periode.jours();
+            joursTotal += jours[i];
         }
 
-        BigDecimal[] quantites = repartir(saisie.quantite, poids, totalJours, decimales);
-        BigDecimal[] payes     = repartir(saisie.paye,     poids, totalJours, decimales);
-        BigDecimal[] icccps    = repartir(saisie.icccp,    poids, totalJours, decimales);
-        BigDecimal[] ifms      = repartir(saisie.ifm,      poids, totalJours, decimales);
-        BigDecimal[] primess   = repartir(saisie.primes,   poids, totalJours, decimales);
+        // Etape 3 : ventiler chaque champ au prorata des jours.
+        BigDecimal[] quantites = repartir(haut.quantite, jours, joursTotal, decimales);
+        BigDecimal[] payes     = repartir(haut.paye,     jours, joursTotal, decimales);
+        BigDecimal[] icccps    = repartir(haut.icccp,    jours, joursTotal, decimales);
+        BigDecimal[] ifms      = repartir(haut.ifm,      jours, joursTotal, decimales);
+        BigDecimal[] primess   = repartir(haut.primes,   jours, joursTotal, decimales);
 
-        for (int i = 0; i < lignes.size(); i++) {
-            LignePeriode l = lignes.get(i);
-            l.datePaye = saisie.datePaye; // la date de paye est recopiée à l'identique
-            l.quantite = quantites[i];
-            l.paye = payes[i];
-            l.icccp = icccps[i];
-            l.ifm = ifms[i];
-            l.primes = primess[i];
+        // Etape 4 : recopier les résultats (et la date de paye) sur chaque ligne.
+        for (int i = 0; i < concernees.size(); i++) {
+            LigneBas ligne = concernees.get(i);
+            ligne.datePaye = haut.datePaye;
+            ligne.quantite = quantites[i];
+            ligne.paye = payes[i];
+            ligne.icccp = icccps[i];
+            ligne.ifm = ifms[i];
+            ligne.primes = primess[i];
         }
+        return concernees;
     }
 
     /**
-     * Répartit un montant total selon des poids (nb de jours), en garantissant que
-     * la somme des parts est exactement égale au total (méthode du plus fort reste).
+     * Répartit un montant total selon des poids (le nombre de jours), en garantissant
+     * que la somme des parts est EXACTEMENT égale au total (méthode du plus fort reste,
+     * pour éviter toute perte d'arrondi).
      */
-    static BigDecimal[] repartir(BigDecimal total, long[] poids, long totalPoids, int decimales) {
-        BigDecimal[] resultat = new BigDecimal[poids.length];
-        if (total == null) {
-            for (int i = 0; i < poids.length; i++) {
-                resultat[i] = BigDecimal.ZERO.setScale(decimales, RoundingMode.HALF_UP);
-            }
-            return resultat;
-        }
-
+    static BigDecimal[] repartir(BigDecimal total, long[] jours, long joursTotal, int decimales) {
+        BigDecimal[] parts = new BigDecimal[jours.length];
         BigDecimal totalArrondi = total.setScale(decimales, RoundingMode.HALF_UP);
-        BigDecimal poidsTotalBd = BigDecimal.valueOf(totalPoids);
+        BigDecimal joursTotalBd = BigDecimal.valueOf(joursTotal);
+        BigDecimal unite = BigDecimal.ONE.movePointLeft(decimales); // ex : 0.01
 
-        // Part théorique (non arrondie) et part plancher (arrondie vers le bas) de chaque ligne
-        BigDecimal[] exactes = new BigDecimal[poids.length];
-        BigDecimal sommePlanchers = BigDecimal.ZERO;
-        for (int i = 0; i < poids.length; i++) {
-            exactes[i] = totalArrondi
-                    .multiply(BigDecimal.valueOf(poids[i]))
-                    .divide(poidsTotalBd, decimales + 6, RoundingMode.HALF_UP);
-            resultat[i] = exactes[i].setScale(decimales, RoundingMode.FLOOR);
-            sommePlanchers = sommePlanchers.add(resultat[i]);
+        // 3a) Part de chaque ligne, arrondie vers le bas, + mémorisation du reste.
+        BigDecimal[] restes = new BigDecimal[jours.length];
+        BigDecimal sommeParts = BigDecimal.ZERO;
+        for (int i = 0; i < jours.length; i++) {
+            BigDecimal exact = totalArrondi
+                    .multiply(BigDecimal.valueOf(jours[i]))
+                    .divide(joursTotalBd, decimales + 6, RoundingMode.HALF_UP);
+            parts[i] = exact.setScale(decimales, RoundingMode.FLOOR);
+            restes[i] = exact.subtract(parts[i]);
+            sommeParts = sommeParts.add(parts[i]);
         }
 
-        // Reste à distribuer (en nombre d'incréments de la plus petite unité)
-        BigDecimal unite = BigDecimal.ONE.movePointLeft(decimales); // ex: 0.01 pour 2 décimales
-        BigDecimal restant = totalArrondi.subtract(sommePlanchers);
-        int incrementsRestants = restant.divide(unite, 0, RoundingMode.HALF_UP).intValueExact();
-
-        // Attribuer les unités restantes aux lignes ayant le plus fort reste fractionnaire
-        Integer[] ordre = new Integer[poids.length];
-        for (int i = 0; i < ordre.length; i++) ordre[i] = i;
-        BigDecimal[] restes = new BigDecimal[poids.length];
-        for (int i = 0; i < poids.length; i++) {
-            restes[i] = exactes[i].subtract(resultat[i]);
+        // 3b) Distribuer les unités manquantes aux lignes ayant le plus fort reste.
+        int manquantes = totalArrondi.subtract(sommeParts)
+                .divide(unite, 0, RoundingMode.HALF_UP).intValueExact();
+        for (int n = 0; n < manquantes; n++) {
+            int meilleur = 0;
+            for (int i = 1; i < restes.length; i++) {
+                if (restes[i].compareTo(restes[meilleur]) > 0) {
+                    meilleur = i;
+                }
+            }
+            parts[meilleur] = parts[meilleur].add(unite);
+            restes[meilleur] = BigDecimal.valueOf(-1); // déjà servie
         }
-        java.util.Arrays.sort(ordre, (a, b) -> {
-            int cmp = restes[b].compareTo(restes[a]);   // plus fort reste d'abord
-            if (cmp != 0) return cmp;
-            return Long.compare(poids[b], poids[a]);     // puis plus grand poids
-        });
-
-        for (int k = 0; k < incrementsRestants; k++) {
-            int idx = ordre[k % ordre.length];
-            resultat[idx] = resultat[idx].add(unite);
-        }
-        return resultat;
+        return parts;
     }
+
+    // ---------------------------------------------------------------------
+    // 3) Exemple d'utilisation
+    // ---------------------------------------------------------------------
 
     public static void main(String[] args) {
-        // --- Tableau du BAS : les 3 périodes ---
-        List<LignePeriode> lignes = new ArrayList<>();
-        lignes.add(new LignePeriode("01/06/2025", "01/06/2025")); // 1 jour
-        lignes.add(new LignePeriode("04/06/2025", "05/06/2025")); // 2 jours
-        lignes.add(new LignePeriode("10/06/2025", "12/06/2025")); // 3 jours
+        // Tableau du BAS : toutes les périodes disponibles.
+        List<LigneBas> toutesBas = new ArrayList<>();
+        toutesBas.add(new LigneBas(new Periode("01/06/2025", "01/06/2025"))); // 1 jour
+        toutesBas.add(new LigneBas(new Periode("04/06/2025", "05/06/2025"))); // 2 jours
+        toutesBas.add(new LigneBas(new Periode("10/06/2025", "12/06/2025"))); // 3 jours
+        toutesBas.add(new LigneBas(new Periode("05/07/2025", "06/07/2025"))); // hors période (ignorée)
 
-        // --- Tableau du HAUT : une seule saisie pour la période 01/06 -> 30/06 ---
-        SaisieHaut saisie = new SaisieHaut(
-                "30/06/2025",                 // date de paye (recopiée)
-                new BigDecimal("6"),          // quantité (ex: nb de jours saisis)
-                new BigDecimal("23882"),      // paye
-                new BigDecimal("1200"),       // icccp
-                new BigDecimal("800"),        // ifm
-                new BigDecimal("300")         // primes
+        // Tableau du HAUT : une seule saisie pour la période 01/06 -> 30/06.
+        LigneHaut haut = new LigneHaut(
+                new Periode("01/06/2025", "30/06/2025"),
+                "30/06/2025", // date de paye (recopiée)
+                6,            // quantité
+                23882,        // paye
+                1200,         // icccp
+                800,          // ifm
+                300           // primes
         );
 
-        // Ventilation au prorata des jours, montants à 2 décimales
-        ventiler(lignes, saisie, 2);
+        // Ventilation : on part de la période du haut pour retrouver les lignes du bas.
+        List<LigneBas> resultat = ventiler(haut, toutesBas, 2);
 
-        // --- Affichage du résultat ---
-        long totalJours = lignes.stream().mapToLong(l -> l.nbJours).sum();
-        System.out.println("Nombre total de jours sur les " + lignes.size() + " lignes: " + totalJours);
-        System.out.println();
-        System.out.printf("%-24s %-6s %-10s %-12s %-10s %-9s %-9s%n",
+        // Affichage.
+        long joursTotal = resultat.stream().mapToLong(l -> l.periode.jours()).sum();
+        System.out.println("Période du haut : " + haut.periode);
+        System.out.println("Lignes du bas concernées : " + resultat.size()
+                + " (total " + joursTotal + " jours)\n");
+
+        System.out.printf("%-24s %-6s %-11s %-11s %-9s %-8s %-8s%n",
                 "Période", "Jours", "DatePaye", "Paye", "ICCCP", "IFM", "Primes");
-
-        BigDecimal sPaye = BigDecimal.ZERO, sIcccp = BigDecimal.ZERO,
-                   sIfm = BigDecimal.ZERO, sPrimes = BigDecimal.ZERO, sQte = BigDecimal.ZERO;
-        for (LignePeriode l : lignes) {
-            System.out.printf("%-10s -> %-10s %-6d %-10s %-12s %-10s %-9s %-9s%n",
-                    l.dateDebut.format(FMT), l.dateFin.format(FMT), l.nbJours,
-                    l.datePaye, l.paye, l.icccp, l.ifm, l.primes);
-            sQte = sQte.add(l.quantite);
-            sPaye = sPaye.add(l.paye);
-            sIcccp = sIcccp.add(l.icccp);
-            sIfm = sIfm.add(l.ifm);
-            sPrimes = sPrimes.add(l.primes);
+        for (LigneBas l : resultat) {
+            System.out.printf("%-24s %-6d %-11s %-11s %-9s %-8s %-8s%n",
+                    l.periode, l.periode.jours(), l.datePaye, l.paye, l.icccp, l.ifm, l.primes);
         }
 
-        System.out.println();
-        System.out.println("Contrôle des totaux (doivent égaler la saisie du haut):");
-        System.out.println("  Quantité : " + sQte    + " (saisi: " + saisie.quantite + ")");
-        System.out.println("  Paye     : " + sPaye   + " (saisi: " + saisie.paye + ")");
-        System.out.println("  ICCCP    : " + sIcccp  + " (saisi: " + saisie.icccp + ")");
-        System.out.println("  IFM      : " + sIfm    + " (saisi: " + saisie.ifm + ")");
-        System.out.println("  Primes   : " + sPrimes + " (saisi: " + saisie.primes + ")");
+        // Contrôle : la somme des lignes doit égaler la saisie du haut.
+        System.out.println("\nContrôle des totaux (doivent égaler la saisie) :");
+        System.out.println("  Paye   : " + somme(resultat, l -> l.paye)   + " / " + haut.paye);
+        System.out.println("  ICCCP  : " + somme(resultat, l -> l.icccp)  + " / " + haut.icccp);
+        System.out.println("  IFM    : " + somme(resultat, l -> l.ifm)    + " / " + haut.ifm);
+        System.out.println("  Primes : " + somme(resultat, l -> l.primes) + " / " + haut.primes);
+        System.out.println("  Qté    : " + somme(resultat, l -> l.quantite) + " / " + haut.quantite);
+    }
+
+    /** Petite aide pour additionner un champ de toutes les lignes. */
+    interface Champ { BigDecimal de(LigneBas l); }
+
+    static BigDecimal somme(List<LigneBas> lignes, Champ champ) {
+        BigDecimal total = BigDecimal.ZERO;
+        for (LigneBas l : lignes) {
+            total = total.add(champ.de(l));
+        }
+        return total;
     }
 }
